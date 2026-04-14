@@ -1,0 +1,14 @@
+# Credenciais e segredos — nunca versionar
+.env
+credentials.json
+token.json
+
+# Banco de dados e estado local
+memoria.db
+state.json
+log.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
