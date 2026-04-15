@@ -100,23 +100,49 @@ Na **primeira execução**, o browser abrirá para autenticação OAuth com o Go
 
 ## Formato dos arquivos .md de agenda
 
-O agente lê qualquer arquivo Markdown. O formato recomendado é cronológico reverso (mais recente no topo):
+Cada arquivo deve seguir obrigatoriamente a estrutura de duas seções:
 
 ```markdown
-# Nome do Projeto
+# Escopo
 
-Descrição geral do projeto.
+Contexto permanente do projeto: objetivo, participantes fixos, tecnologias,
+regras de negócio. Esta seção é processada uma única vez pelo agente.
 
-# 14 de abril de 2026
+---
 
-- Reunião de entrega às 14h com cliente X.
-- Produto 2 finalizado.
-- Próximo passo: iniciar Produto 3.
+# Agenda
 
-# 10 de abril de 2026
+## 14 de abril de 2026
+
+Conteúdo mais recente sempre no topo desta seção.
+Decisões tomadas, prazos, responsabilidades, próximos passos.
+
+## 10 de abril de 2026
 
 ...
 ```
+
+### Regras importantes
+
+| Regra | Motivo |
+|---|---|
+| `# Escopo` sempre antes de `# Agenda` | O agente detecta a seção pelo cabeçalho |
+| Novas entradas sempre no **topo** da seção `# Agenda` | O agente reprocessa a seção inteira quando o arquivo muda |
+| Datas no cabeçalho das entradas (`## DD de mês de AAAA`) | Facilita a extração de contexto temporal |
+| Prazos e nomes escritos por extenso | O Gemini extrai melhor entidades explícitas do que abreviações |
+
+### O que escrever para maximizar a qualidade do grafo
+
+O agente extrai mais valor de texto que mencione explicitamente:
+
+- **Status** — "Produto 2 finalizado.", "Em andamento.", "Atrasado."
+- **Prazos** — "Entrega prevista para 30/04/2026.", "Reunião às 14h."
+- **Pessoas** — nomes completos na primeira menção ("Keila Ferreira"), apelidos depois
+- **Responsabilidades** — "Marco Antonio ficou de enviar até sexta."
+- **Riscos** — "Dados desatualizados.", "Dependência do Luciano para acesso ao sistema."
+- **Próximos passos** — "Próximo passo: redigir relatório final."
+
+Use `agenda_template.md` como ponto de partida para novos projetos.
 
 ---
 

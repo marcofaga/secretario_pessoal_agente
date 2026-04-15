@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 
+import pyperclip
 import google.generativeai as genai
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -82,8 +83,13 @@ class AgenteMarcoV2:
 
     def _carregar_state(self) -> dict:
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            for enc in ("utf-8", "utf-8-sig", "utf-16"):
+                try:
+                    with open(STATE_FILE, "r", encoding=enc) as f:
+                        return json.load(f)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+            print("  [Aviso] state.json corrompido — reiniciando estado.")
         return {"arquivos": {}}
 
     def _salvar_state(self):
@@ -104,13 +110,28 @@ class AgenteMarcoV2:
                 continue
 
             mtime_atual = os.path.getmtime(caminho)
-            info = self.state["arquivos"].get(caminho, {"mtime": 0, "ultima_linha": 0})
+            info = self.state["arquivos"].get(caminho, {
+                "mtime": 0,
+                "escopo_processado": False,
+                "agenda_start_line": 0,
+            })
 
             if mtime_atual <= info["mtime"]:
                 continue  # arquivo não mudou
 
             print(f"  [Miner] Processando: {_nome_curto(caminho)}")
-            triplas, nova_linha, sucesso = self.miner.processar_arquivo(caminho, info["ultima_linha"])
+
+            # Determina a partir de qual linha processar
+            if not info["escopo_processado"]:
+                # Primeira execução: processa tudo e localiza onde começa a seção # Agenda
+                start_line = 0
+                agenda_start = _encontrar_secao_agenda(caminho)
+            else:
+                # Execuções seguintes: reprocessa só a seção # Agenda (dedup garante idempotência)
+                start_line = info["agenda_start_line"]
+                agenda_start = info["agenda_start_line"]
+
+            triplas, _, sucesso = self.miner.processar_arquivo(caminho, start_line)
 
             if sucesso:
                 if triplas:
@@ -119,7 +140,8 @@ class AgenteMarcoV2:
                     print(f"    -> {len(triplas)} triplas extraídas, {inseridas} novas no grafo.")
                 self.state["arquivos"][caminho] = {
                     "mtime": mtime_atual,
-                    "ultima_linha": nova_linha,
+                    "escopo_processado": True,
+                    "agenda_start_line": agenda_start,
                 }
             else:
                 print(f"    -> Erro na extração. Estado não salvo — será reprocessado na próxima execução.")
@@ -294,6 +316,19 @@ INSTRUÇÕES:
 # Utilitário
 # ---------------------------------------------------------------------------
 
+def _encontrar_secao_agenda(caminho: str) -> int:
+    """Retorna o índice da linha onde começa a seção '# Agenda'.
+    Se não encontrar, retorna 0 (processa o arquivo inteiro)."""
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            for i, linha in enumerate(f):
+                if linha.strip().lower().startswith("# agenda"):
+                    return i
+    except Exception:
+        pass
+    return 0
+
+
 def _nome_curto(caminho: str) -> str:
     """Extrai um nome legível do caminho do arquivo de agenda."""
     ignorar = {
@@ -311,9 +346,17 @@ def _nome_curto(caminho: str) -> str:
 # Execução
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import pyperclip
+
     os.system("cls")
     agente = AgenteMarcoV2()
     briefing = agente.gerar_briefing()
     print("\n" + "=" * 60)
     print(briefing)
     agente.log(briefing)
+
+    try:
+        pyperclip.copy(briefing)
+        print("\n[Briefing copiado para a área de transferência.]")
+    except Exception as e:
+        print(f"\n[Não foi possível copiar: {e}]")
