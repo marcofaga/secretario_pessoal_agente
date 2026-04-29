@@ -55,15 +55,20 @@ class MemoryInterface:
 
     def listar_top_por_projeto(self, n_por_projeto=10) -> dict:
         """
-        Retorna as N triplas mais recentes de cada projeto (fonte).
+        Retorna as N triplas mais recentes de cada projeto (fonte), sem duplicatas de (sujeito, relacao).
+        Quando a mesma relação foi extraída múltiplas vezes para o mesmo sujeito, mantém apenas
+        a inserção mais recente (MAX id), evitando que estados antigos contradigam os atuais.
         Retorna um dict: {fonte: [triplas]}.
         """
         query = """
             SELECT sujeito, relacao, objeto, data_referencia, fonte
             FROM (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY fonte ORDER BY data_referencia DESC, id ASC) AS rn
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY fonte ORDER BY data_referencia DESC, id DESC) AS rn
                 FROM triplas
                 WHERE fonte IS NOT NULL
+                  AND id IN (
+                      SELECT MAX(id) FROM triplas WHERE fonte IS NOT NULL GROUP BY sujeito, relacao, fonte
+                  )
             )
             WHERE rn <= ?
             ORDER BY fonte, data_referencia DESC, id ASC
@@ -93,15 +98,34 @@ class MemoryInterface:
             p = f"%{t}%"
             params += [p, p, p]
         query = f"""
-            SELECT DISTINCT sujeito, relacao, objeto, data_referencia, fonte
+            SELECT sujeito, relacao, objeto, data_referencia, fonte
             FROM triplas
-            WHERE {condicoes}
+            WHERE ({condicoes})
+              AND id IN (
+                  SELECT MAX(id) FROM triplas GROUP BY sujeito, relacao, fonte
+              )
             ORDER BY data_referencia DESC
             LIMIT ?
         """
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(query, params + [limite]).fetchall()
         return [{"sujeito": r[0], "relacao": r[1], "objeto": r[2], "data": r[3], "fonte": r[4]} for r in rows]
+
+    def limpar_duplicatas(self) -> int:
+        """
+        Remove do banco todas as triplas com (sujeito, relacao, fonte) duplicados,
+        mantendo apenas a inserção mais recente (MAX id) de cada combinação.
+        Retorna o número de linhas removidas.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("""
+                DELETE FROM triplas
+                WHERE id NOT IN (
+                    SELECT MAX(id) FROM triplas GROUP BY sujeito, relacao, fonte
+                )
+            """)
+            conn.commit()
+            return cur.rowcount
 
     def listar_recentes(self, limite=100) -> list:
         with sqlite3.connect(self.db_path) as conn:

@@ -1,6 +1,6 @@
 # Agente Secretário Executivo Pessoal
 
-Agente de IA que atua como secretário executivo pessoal, integrando Google Calendar, Google Tasks e arquivos de agenda em Markdown para gerar um briefing matinal estruturado. Mantém uma **memória de grafo de conhecimento** em SQLite para conectar pessoas, projetos e prazos ao longo do tempo.
+Agente de IA que atua como secretário executivo pessoal, integrando Google Calendar, Google Tasks e arquivos de projeto em Markdown para gerar um briefing matinal estruturado.
 
 ---
 
@@ -8,11 +8,10 @@ Agente de IA que atua como secretário executivo pessoal, integrando Google Cale
 
 A cada execução o agente:
 
-1. **Detecta mudanças** nos arquivos `.md` de projetos (via `mtime`) e minera apenas o conteúdo novo
-2. **Extrai triplas** do tipo `Marco Antonio --[tem_prazo_em]--> 22/04/2026` usando o Gemini
+1. **Lê a seção `# Estado Atual`** de cada arquivo `.md` de projeto — fonte de verdade sobre o que está em aberto
+2. **Filtra itens concluídos** — linhas `- [x]` são ignoradas; só chegam ao briefing os `- [ ]`
 3. **Busca agenda e tarefas** via Google Calendar e Google Tasks
-4. **Monta contexto** cruzando o estado de cada projeto com os compromissos do dia
-5. **Gera o briefing** com seções de Agenda, Projetos, Tarefas, Foco do Dia e Pontos de Atenção
+4. **Gera o briefing** cruzando tudo com o estado declarado de cada projeto
 
 ```
 [AGENDA]             compromissos do dia com contexto dos projetos
@@ -22,6 +21,8 @@ A cada execução o agente:
 [PONTOS DE ATENÇÃO]  prazos críticos e riscos detectados
 ```
 
+O agente também mantém um grafo de conhecimento secundário (SQLite) para contextualizar compromissos da agenda com informações históricas dos projetos.
+
 ---
 
 ## Estrutura do projeto
@@ -29,13 +30,13 @@ A cada execução o agente:
 ```
 agente/
 ├── agente_v2.py          # Classe principal AgenteMarcoV2
-├── graph_miner.py        # Extração de triplas via Gemini
+├── graph_miner.py        # Extração de triplas via Gemini (contexto de agenda)
 ├── memory_interface.py   # Grafo de conhecimento (SQLite)
-├── ver_grafo.py          # Ferramenta de inspeção do banco
-├── agente_v2_test.py     # Dry run — imprime prompt sem chamar a API
-├── SPEC.md               # Especificação técnica detalhada
+├── ver_grafo.py          # Ferramenta de inspeção do banco de triplas
+├── agente_v2_test.py     # Dry run — imprime o prompt sem chamar a API
+├── agenda_template.md    # Template para novos arquivos de projeto
 ├── memoria.db            # Banco SQLite (gerado automaticamente)
-├── state.json            # Estado incremental de processamento
+├── state.json            # Estado incremental de processamento (gerado automaticamente)
 ├── log.json              # Histórico de briefings gerados
 ├── credentials.json      # Credenciais Google OAuth (não versionar)
 └── token.json            # Token de acesso Google (não versionar)
@@ -50,7 +51,7 @@ agente/
 - Chave de API do Google Gemini
 
 ```bash
-pip install google-generativeai google-api-python-client google-auth-oauthlib python-dotenv
+pip install google-generativeai google-api-python-client google-auth-oauthlib python-dotenv pyperclip
 ```
 
 ---
@@ -71,76 +72,69 @@ Edite o `.env`:
 ```
 GEMINI_API_KEY=sua_chave_aqui
 ```
-O `.env` está no `.gitignore` e nunca será enviado ao repositório.
 
 **3. Caminhos dos projetos**
 
-Em `agente_v2.py`, ajuste a lista `PROJETOS` com os caminhos dos seus arquivos `.md` de agenda.
+Em `agente_v2.py`, ajuste a lista `PROJETOS` com os caminhos dos seus arquivos `.md`.
 
 ---
 
 ## Uso
 
 ```bash
-# Briefing completo
+# Briefing completo (resultado copiado para a área de transferência)
 python agente_v2.py
 
-# Dry run — ver o prompt sem chamar a API de briefing
+# Dry run — ver o prompt montado sem chamar a API de briefing
 python agente_v2_test.py
 
-# Inspecionar o grafo de conhecimento
+# Inspecionar o grafo de conhecimento secundário
 python ver_grafo.py                  # visão geral por projeto
 python ver_grafo.py "Marco Antonio"  # filtrar por termo
-python ver_grafo.py CADE             # filtrar por projeto
 ```
 
 Na **primeira execução**, o browser abrirá para autenticação OAuth com o Google. O token é salvo em `token.json` para execuções futuras.
 
 ---
 
-## Formato dos arquivos .md de agenda
+## Formato dos arquivos `.md` de projeto
 
-Cada arquivo deve seguir obrigatoriamente a estrutura de duas seções:
+Cada arquivo deve ter obrigatoriamente a seção `# Estado Atual`. A seção `# Agenda` é opcional e serve apenas como diário histórico — o agente não a lê para o briefing.
 
 ```markdown
-# Escopo
+# Estado Atual
 
-Contexto permanente do projeto: objetivo, participantes fixos, tecnologias,
-regras de negócio. Esta seção é processada uma única vez pelo agente.
+- [x] Planilha entregue ao CADE
+- [x] Produto 2 finalizado com Luciano e Andréia
+- [ ] Aguardar resposta do CADE para iniciar Produto 3
+- [ ] Entregar Produto 3 - Prazo: 29/04
 
 ---
 
 # Agenda
 
-## 14 de abril de 2026
+<!-- Diário histórico — não é lido pelo agente para o briefing -->
 
-Conteúdo mais recente sempre no topo desta seção.
-Decisões tomadas, prazos, responsabilidades, próximos passos.
+## 28 de abril de 2026
 
-## 10 de abril de 2026
-
-...
+Terminei a planilha e enviei para o CADE...
 ```
 
-### Regras importantes
+### Regras da seção `# Estado Atual`
 
-| Regra | Motivo |
+| Elemento | Comportamento |
 |---|---|
-| `# Escopo` sempre antes de `# Agenda` | O agente detecta a seção pelo cabeçalho |
-| Novas entradas sempre no **topo** da seção `# Agenda` | O agente reprocessa a seção inteira quando o arquivo muda |
-| Datas no cabeçalho das entradas (`## DD de mês de AAAA`) | Facilita a extração de contexto temporal |
-| Prazos e nomes escritos por extenso | O Gemini extrai melhor entidades explícitas do que abreviações |
+| `- [ ] tarefa` | Aparece no briefing como pendência |
+| `- [ ] tarefa - Prazo: DD/MM` | Aparece no briefing com o prazo destacado |
+| `- [x] tarefa` | **Ignorado** pelo agente — não aparece no briefing |
+| Texto livre | Incluído no briefing normalmente |
 
-### O que escrever para maximizar a qualidade do grafo
+### Boas práticas
 
-O agente extrai mais valor de texto que mencione explicitamente:
-
-- **Status** — "Produto 2 finalizado.", "Em andamento.", "Atrasado."
-- **Prazos** — "Entrega prevista para 30/04/2026.", "Reunião às 14h."
-- **Pessoas** — nomes completos na primeira menção ("Keila Ferreira"), apelidos depois
-- **Responsabilidades** — "Marco Antonio ficou de enviar até sexta."
-- **Riscos** — "Dados desatualizados.", "Dependência do Luciano para acesso ao sistema."
-- **Próximos passos** — "Próximo passo: redigir relatório final."
+- Mantenha a seção curta — 5 a 15 linhas é o ideal
+- Ao concluir uma tarefa, troque `[ ]` por `[x]` (não delete)
+- Inclua prazos próximos em texto livre: `**Próximos prazos:** DD/MM — descrição`
+- Use a seção `# Agenda` livremente como diário — ela não afeta o briefing
 
 Use `agenda_template.md` como ponto de partida para novos projetos.
 
@@ -149,9 +143,11 @@ Use `agenda_template.md` como ponto de partida para novos projetos.
 ## .gitignore recomendado
 
 ```
+.env
 credentials.json
 token.json
 memoria.db
+state.json
 log.json
 __pycache__/
 *.pyc
@@ -162,6 +158,6 @@ __pycache__/
 ## Tecnologias
 
 - **LLM:** Google Gemini 2.5 Flash Lite
-- **Memória:** SQLite com grafo de triplas (sujeito → relação → objeto)
 - **APIs:** Google Calendar, Google Tasks (OAuth 2.0)
+- **Grafo secundário:** SQLite com triplas (sujeito → relação → objeto)
 - **Linguagem:** Python 3.10+

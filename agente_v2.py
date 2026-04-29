@@ -1,8 +1,8 @@
 import os
+import re
 import json
 import datetime
 
-import pyperclip
 import google.generativeai as genai
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -10,12 +10,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from graph_miner import GraphMiner
-from memory_interface import MemoryInterface
-
-# ---------------------------------------------------------------------------
-# Configuração — chave lida do arquivo .env (nunca versionar o .env)
-# ---------------------------------------------------------------------------
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
@@ -25,12 +19,11 @@ SCOPES = [
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(BASE_DIR, "state.json")
 LOG_FILE = os.path.join(BASE_DIR, "log.json")
 
 
 class AgenteMarcoV2:
-    """Secretário Executivo com Memória de Grafo (v2.0)."""
+    """Secretário Executivo Pessoal."""
 
     PROJETOS = [
         "G:/Meu Drive/MAFData/projetosAtivos/20251009 - CADE PNUD/03_produtos/administrativo/agenda.md",
@@ -45,14 +38,8 @@ class AgenteMarcoV2:
 
     def __init__(self):
         genai.configure(api_key=GEMINI_API_KEY)
-
-        self._model_miner = genai.GenerativeModel("gemini-2.5-flash-lite")
-        self._model_briefing = genai.GenerativeModel("gemini-2.5-flash-lite")
-
-        self.memory = MemoryInterface()
-        self.miner = GraphMiner(self._model_miner)
+        self._model = genai.GenerativeModel("gemini-2.5-flash-lite")
         self.creds = self._autenticar()
-        self.state = self._carregar_state()
 
     # ------------------------------------------------------------------
     # Autenticação Google
@@ -76,78 +63,6 @@ class AgenteMarcoV2:
                 f.write(creds.to_json())
 
         return creds
-
-    # ------------------------------------------------------------------
-    # Estado persistente (state.json)
-    # ------------------------------------------------------------------
-
-    def _carregar_state(self) -> dict:
-        if os.path.exists(STATE_FILE):
-            for enc in ("utf-8", "utf-8-sig", "utf-16"):
-                try:
-                    with open(STATE_FILE, "r", encoding=enc) as f:
-                        return json.load(f)
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-            print("  [Aviso] state.json corrompido — reiniciando estado.")
-        return {"arquivos": {}}
-
-    def _salvar_state(self):
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, indent=4, ensure_ascii=False)
-
-    # ------------------------------------------------------------------
-    # Processamento incremental dos projetos
-    # ------------------------------------------------------------------
-
-    def processar_projetos(self):
-        """Verifica mudanças nos arquivos .md e minera novas triplas."""
-        hoje = datetime.date.today().isoformat()
-        total_novas = 0
-
-        for caminho in self.PROJETOS:
-            if not os.path.exists(caminho):
-                continue
-
-            mtime_atual = os.path.getmtime(caminho)
-            info = self.state["arquivos"].get(caminho, {
-                "mtime": 0,
-                "escopo_processado": False,
-                "agenda_start_line": 0,
-            })
-
-            if mtime_atual <= info["mtime"]:
-                continue  # arquivo não mudou
-
-            print(f"  [Miner] Processando: {_nome_curto(caminho)}")
-
-            # Determina a partir de qual linha processar
-            if not info["escopo_processado"]:
-                # Primeira execução: processa tudo e localiza onde começa a seção # Agenda
-                start_line = 0
-                agenda_start = _encontrar_secao_agenda(caminho)
-            else:
-                # Execuções seguintes: reprocessa só a seção # Agenda (dedup garante idempotência)
-                start_line = info["agenda_start_line"]
-                agenda_start = info["agenda_start_line"]
-
-            triplas, _, sucesso = self.miner.processar_arquivo(caminho, start_line)
-
-            if sucesso:
-                if triplas:
-                    inseridas = self.memory.inserir_lote(triplas, data_referencia=hoje, fonte=caminho)
-                    total_novas += inseridas
-                    print(f"    -> {len(triplas)} triplas extraídas, {inseridas} novas no grafo.")
-                self.state["arquivos"][caminho] = {
-                    "mtime": mtime_atual,
-                    "escopo_processado": True,
-                    "agenda_start_line": agenda_start,
-                }
-            else:
-                print(f"    -> Erro na extração. Estado não salvo — será reprocessado na próxima execução.")
-
-        self._salvar_state()
-        print(f"  [Grafo] Total no banco: {self.memory.contar()} triplas (+{total_novas} hoje).")
 
     # ------------------------------------------------------------------
     # Fontes de dados Google
@@ -186,81 +101,31 @@ class AgenteMarcoV2:
         return tarefas
 
     # ------------------------------------------------------------------
-    # Contexto do grafo
+    # Estado dos projetos
     # ------------------------------------------------------------------
 
-    def _extrair_entidades_da_agenda(self, agenda: list) -> list:
-        """Pede ao Gemini uma lista de entidades-chave mencionadas na agenda."""
-        if not agenda:
-            return []
-        texto_agenda = "\n".join(agenda)
-        prompt = f"""
-Da lista de compromissos abaixo, extraia os nomes de pessoas, projetos e instituições mencionados.
-Retorne APENAS um JSON com uma lista de strings, sem texto adicional.
-Exemplo: ["Gabriel Cepaluni", "CADE", "FGV"]
-
-COMPROMISSOS:
-{texto_agenda}
-"""
-        try:
-            raw = self._model_miner.generate_content(prompt).text.strip()
-            if raw.startswith("```"):
-                partes = raw.split("```")
-                raw = partes[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            entidades = json.loads(raw.strip())
-            return entidades if isinstance(entidades, list) else []
-        except Exception:
-            return []
-
-    def _montar_contexto_grafo(self, agenda: list) -> str:
-        """
-        Monta o bloco de contexto do grafo com duas seções:
-        1. Estado atual de cada projeto (top N triplas por projeto)
-        2. Triplas fuzzy relacionadas aos compromissos de hoje
-        """
-        linhas = []
-
-        # --- Seção 1: Estado dos projetos ---
-        linhas.append("--- ESTADO DOS PROJETOS ---")
-        por_projeto = self.memory.listar_top_por_projeto(n_por_projeto=10)
-        if por_projeto:
-            for fonte, triplas in por_projeto.items():
-                nome = _nome_curto(fonte)
-                linhas.append(f"\n[{nome}]")
-                for t in triplas:
-                    linhas.append(f"  {t['sujeito']} --[{t['relacao']}]--> {t['objeto']} ({t['data']})")
-        else:
-            linhas.append("  (grafo ainda vazio)")
-
-        # --- Seção 2: Contexto da agenda de hoje ---
-        entidades = self._extrair_entidades_da_agenda(agenda)
-        if entidades:
-            linhas.append("\n--- CONTEXTO DA AGENDA DE HOJE ---")
-            fuzzy = self.memory.buscar_fuzzy(entidades)
-            if fuzzy:
-                for t in fuzzy:
-                    linhas.append(f"  {t['sujeito']} --[{t['relacao']}]--> {t['objeto']} ({t['data']})")
-            else:
-                linhas.append("  (nenhuma relação encontrada para os compromissos de hoje)")
-
-        return "\n".join(linhas)
+    def _montar_estado_projetos(self) -> str:
+        """Lê a seção '# Estado Atual' de cada projeto diretamente do arquivo."""
+        blocos = []
+        for caminho in self.PROJETOS:
+            if not os.path.exists(caminho):
+                continue
+            estado = _filtrar_concluidos(_ler_secao(caminho, "# Estado Atual"))
+            if estado:
+                blocos.append(f"[{_nome_curto(caminho)}]\n{estado}")
+        return "\n\n".join(blocos) if blocos else "(nenhuma seção '# Estado Atual' encontrada nos projetos)"
 
     # ------------------------------------------------------------------
     # Briefing
     # ------------------------------------------------------------------
 
     def gerar_briefing(self) -> str:
-        print("[1/4] Processando projetos e atualizando grafo...")
-        self.processar_projetos()
-
-        print("[2/4] Buscando agenda e tarefas...")
+        print("[1/3] Buscando agenda e tarefas...")
         agenda = self._get_agenda()
         tarefas = self._get_tarefas()
 
-        print("[3/4] Montando contexto do grafo...")
-        contexto_grafo = self._montar_contexto_grafo(agenda)
+        print("[2/3] Lendo estado dos projetos...")
+        estado_projetos = self._montar_estado_projetos()
 
         data_hoje = datetime.datetime.now().strftime("%d/%m/%Y")
 
@@ -276,13 +141,14 @@ FONTES DE DADOS:
 [TAREFAS PESSOAIS (Google Tasks)]
 {tarefas}
 
-[MEMÓRIA DOS PROJETOS]
-{contexto_grafo}
+[ESTADO ATUAL DOS PROJETOS — declarado pelo usuário]
+{estado_projetos}
 
 INSTRUÇÕES:
 - Concilie vida pessoal (tarefas, saúde, família) com os projetos profissionais.
 - Cruze compromissos da agenda com o estado atual de cada projeto.
 - Detecte prazos críticos, dependências e oportunidades de avanço.
+- O estado dos projetos acima é a fonte de verdade — não infira pendências que não estejam explicitadas nele.
 - Gere um briefing matinal estruturado em:
   [AGENDA] — compromissos do dia com contexto relevante
   [PROJETOS] — status rápido de cada frente ativa
@@ -291,8 +157,8 @@ INSTRUÇÕES:
   [PONTOS DE ATENÇÃO] — prazos críticos e riscos detectados
 """
 
-        print("[4/4] Gerando briefing...")
-        response = self._model_briefing.generate_content(prompt)
+        print("[3/3] Gerando briefing...")
+        response = self._model.generate_content(prompt)
         return response.text
 
     # ------------------------------------------------------------------
@@ -313,20 +179,34 @@ INSTRUÇÕES:
 
 
 # ---------------------------------------------------------------------------
-# Utilitário
+# Utilitários
 # ---------------------------------------------------------------------------
 
-def _encontrar_secao_agenda(caminho: str) -> int:
-    """Retorna o índice da linha onde começa a seção '# Agenda'.
-    Se não encontrar, retorna 0 (processa o arquivo inteiro)."""
+def _filtrar_concluidos(texto: str) -> str:
+    """Remove linhas de checklist marcadas como concluídas (- [x])."""
+    linhas = [l for l in texto.split("\n") if not re.match(r"\s*-\s*\[x\]\s*", l, re.IGNORECASE)]
+    return "\n".join(linhas).strip()
+
+
+def _ler_secao(caminho: str, titulo: str) -> str:
+    """Extrai o conteúdo de uma seção markdown pelo título (case-insensitive)."""
     try:
         with open(caminho, "r", encoding="utf-8") as f:
-            for i, linha in enumerate(f):
-                if linha.strip().lower().startswith("# agenda"):
-                    return i
+            linhas = f.readlines()
     except Exception:
-        pass
-    return 0
+        return ""
+    titulo_lower = titulo.strip().lower()
+    dentro = False
+    secao = []
+    for linha in linhas:
+        if linha.strip().lower().startswith(titulo_lower):
+            dentro = True
+            continue
+        if dentro:
+            if linha.startswith("#"):
+                break
+            secao.append(linha)
+    return "".join(secao).strip()
 
 
 def _nome_curto(caminho: str) -> str:
@@ -346,7 +226,7 @@ def _nome_curto(caminho: str) -> str:
 # Execução
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import pyperclip
+    import pyperclip  # importado aqui pois só é usado na execução direta
 
     os.system("cls")
     agente = AgenteMarcoV2()
